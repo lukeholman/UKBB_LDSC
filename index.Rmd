@@ -1,0 +1,448 @@
+---
+title: "Calculating genetic correlations using LD score regression via ldsc"
+author: Luke Holman
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cosmo
+    toc_float: true
+---
+
+```{r include=F}
+knitr::opts_chunk$set(warning = F, message = F)
+```
+
+
+## Get packages and HapMap3 data
+
+```{r}
+library(tidyverse)
+library(glue)
+library(DT)
+library(RColorBrewer)
+
+# Get the LD data between hm3 SNPs, if not already downloaded
+if(!file.exists("eur_w_ld_chr/1.l2.ldscore.gz")){
+  system("wget https://data.broadinstitute.org/alkesgroup/LDSCORE/eur_w_ld_chr.tar.bz2")
+  system("tar -jxvf eur_w_ld_chr.tar.bz2")
+  unlink("eur_w_ld_chr.tar.bz2")
+}
+```
+
+
+## Download selected GWAS results from Neale lab site
+
+We selected 43 phenotypic traits from the UK BioBank for which the Neale lab performed genome-wide association tests (their methods are described [here](http://www.nealelab.is/blog/2017/9/11/details-and-considerations-of-the-uk-biobank-gwas)), covering a range of phenotypic traits and health-related outcomes that we believed might plausibly be under sex-specific selection and/or which might plausibly share genetic architecture with the many traits that show a difference in mean trait value between males and females (e.g. size, physiology, metabolism, blood composition, bone mineralisation). We are especially interested in identifying sexually-antagonistic shared phenotypes, understanding the genetic architecture of sexual dimorphism, and testing the hypothesis that sexually antagonistic selection helps to maintain genetic variants that are associated with elevated risk of disease. The list of 43 traits is given in the first line of the code chunk - note that not all 43 of these traits were amenable to statistical testing and thus do not appear in the final figure (e.g. some had too few significantly associated variants, or threw errors when analysed with `ldsc`). After selecting the traits, the relevant GWAS results are downloaded from the Neale lab's repository on AWS, processed, and saved to disk (note: this code downloads many gigabytes of data).
+
+
+```{r}
+phenos <- c("Father's age at death", "Mother's age at death", 
+  "Age at menopause (last menstrual period)", "Age when periods started (menarche)", 
+  "Ever had stillbirth, spontaneous miscarriage or termination", "Birth weight of first child",
+  "Endometriosis of uterus",
+  "Testosterone (nmol/L)", "SHBG (nmol/L)", "Oestradiol (pmol/L)", # 3 sex-related hormones
+  "White blood cell (leukocyte) count", "Red blood cell (erythrocyte) count", "Platelet count",  
+  "Heel bone mineral density (BMD)", 
+  "Fluid intelligence score", "Neuroticism score", 
+  "Body fat percentage", "Standing height",
+  "Schizophrenia, schizotypal and delusional disorders",
+  "Mental health problems ever diagnosed by a professional: Autism, Asperger's or autistic spectrum disorder",
+  "Mental health problems ever diagnosed by a professional: Mania, hypomania, bipolar or manic-depression",
+  "Mental health problems ever diagnosed by a professional: A personality disorder",
+  "Mental health problems ever diagnosed by a professional: Obsessive compulsive disorder (OCD)",
+  "Diseases of the nervous system",
+  "Diseases of the eye and adnexa",
+  "Diseases of the ear and mastoid process",
+  "Vocal cord dysfunction",
+  "Diseases of the respiratory system",
+  "Diseases of the digestive system",
+  "Diseases of the skin and subcutaneous tissue",
+  "Diseases of the musculoskeletal system and connective tissue",
+  "Diseases of the genitourinary system",
+  "Injury, poisoning and certain other consequences of external causes",
+  "Congenital malformations, deformations and chromosomal abnormalities",
+  "Diabetes diagnosed by doctor",
+  "Malignant neoplasm of breast",
+  "Malignant neoplasm of cervix uteri",
+  "Malignant neoplasm of ovary",
+  "Malignant neoplasm of prostate",
+  "Malignant neoplasm of testis",
+  "Vascular/heart problems diagnosed by doctor: Heart attack",
+  "Vascular/heart problems diagnosed by doctor: Stroke",
+  "Vascular/heart problems diagnosed by doctor: High blood pressure")   
+
+female_traits <- c("Malignant neoplasm of breast", # NB "Age at menopause (last menstrual period)" is left off since the file is 'both_sexes'
+  "Malignant neoplasm of cervix uteri", "Endometriosis of uterus",
+  "Malignant neoplasm of ovary", "Birth weight of first child", 
+  "Age when periods started (menarche)", "Ever had stillbirth, spontaneous miscarriage or termination")
+male_traits <- c("Malignant neoplasm of prostate", "Malignant neoplasm of testis")
+
+
+# The manifest of data files from the Neale lab site
+manifest <- read_tsv("data/LDSC Sumstat Manifest for Neale UKB GWAS - ukb31063_ldsc_sumstat_manifest.tsv")
+
+focal_traits <- manifest %>%
+  filter(description %in% phenos) %>% 
+  split(.$phenotype) %>%
+  map_df(~ {
+    if(.x$description[1] %in% female_traits) return(.x %>% filter(sex == "female"))
+    if(.x$description[1] %in% male_traits) return(.x %>% filter(sex == "male"))
+    if(.x$description[1] == "Age at menopause (last menstrual period)") {
+      return(.x %>% filter(sex == "both_sexes") %>% mutate(sex = "female"))
+    }
+    return(.x %>% filter(sex == "both_sexes"))}) %>%
+  arrange(description) %>% 
+  split(.$description) %>%
+  map_df(~ {
+    ifelse(nrow(.x) == 1, 
+           return(.x), return(
+             .x %>% 
+               filter(!(str_detect(phenotype, "_raw") | str_detect(phenotype, "C_")))))
+  }) %>% 
+  split(.$description) %>%
+  map_df(~ {
+    ifelse(nrow(.x) == 1, 
+           return(.x), return(.x %>% 
+                                filter(is_primary_gwas)))
+  })
+
+
+# Write a script to get all the relevant Neale files, and run it in the terminal (does not work via system() for some reason)
+wget_commands <- focal_traits %>% 
+  pull(ldsc_sumstat_wget) %>% 
+  str_remove_all("[?]dl=0")
+write.table(data.frame(wget_commands), 
+            "wget_commands", col.names =F, row.names = F, quote = F)
+
+focal_traits$unzipped_file <- file.path(
+  "data/Neale_sumstats", 
+  map_chr(str_split(wget_commands, "-O "), ~ .x[2]) %>% 
+    str_remove_all("[.]bgz") %>% str_remove_all("[.]gz"))
+
+```
+
+
+## Prepare the `.sumstat` files for `ldsc`
+
+To get all `.sumstat` files in the required format, we unzip the Neale lab `.sumstat` files, and add a column of 2-tailed p-values to all the `.sumstat` files (p-values were calculated from the Z-score via `2 * pnorm(q = -abs(Z))`).
+
+```{r eval=F}
+# Add p-values from Z scores
+ruzicka_files <- list.files("data/Ruzicka_sumstats", full.names = TRUE)
+
+lapply(ruzicka_files, function(filename){
+  print(filename)
+  focal <- read_tsv(filename) %>% 
+    as_tibble() %>% mutate(pval = 2 * pnorm(q = -abs(Z)))
+  print(focal)
+  write_tsv(focal, filename)
+})
+
+neale_files_zipped <- list.files("data/Neale_sumstats", full.names = TRUE, pattern = "gz")
+
+lapply(neale_files_zipped, function(filename){
+  print(filename)
+  focal <- read_tsv(filename) %>% 
+    mutate(pval = 2 * pnorm(q = -abs(Z)))
+  print(focal)
+  write_tsv(focal, str_remove_all(str_remove_all(filename, "[.]bgz"), "[.]gz"))
+})
+
+neale_files_all <- list.files("data/Neale_sumstats", full.names = TRUE)
+neale_files_unzipped <- neale_files_all[!(neale_files_all %in% neale_files_zipped)]
+```
+
+
+## Write scripts to perform LD score regression using `ldsc`
+
+The following code uses R to write the scripts that call `ldsc` to calculate the genetic correlations between a specified list of trait pairs, given in a dataframe called `parameters`. The `parameters` dataframe should have 4 columns, giving the names of the two traits and the file path of their `.sumstat` files. 
+
+```{r}
+get_gen_corr_ldsc <- function(row, parameters){
+  
+  sumstat1 <- parameters$sumstat1[row]  
+  sumstat2 <- parameters$sumstat2[row]
+  trait1 <- parameters$trait1[row]
+  trait2 <- parameters$trait2[row]
+  
+  outfile_name <-  file.path("ldsc_output", paste(trait1, trait2, sep = "_x_"))
+  
+  glue("./ldsc.py --rg {sumstat1},{sumstat2} --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ --out {outfile_name}")
+}
+
+# Make a parameters file to get the genetic correlation between all pairs of Neale traits and all 9 Ruzicka metrics
+paras <- bind_rows(
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Adult_Fst.sumstats", 
+           trait2 = "Adult_Fst"),
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Reproductive_Fst.sumstats", 
+           trait2 = "Reproductive_Fst"),
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Gametic_Fst.sumstats", 
+           trait2 = "Gametic_Fst"),
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Lst.sumstats", 
+           trait2 = "Lst"),
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_t.sumstats", 
+           trait2 = "t"),
+ 
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Unfolded_Fst_negative.sumstats", 
+           trait2 = "Unfolded_Fst_negative"), 
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Unfolded_Fst_positive.sumstats", 
+           trait2 = "Unfolded_Fst_positive"), 
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Unfolded_t_negative.sumstats", 
+           trait2 = "Unfolded_t_negative"), 
+  
+  focal_traits %>% select(sumstat1 = unzipped_file, trait1 = phenotype) %>% 
+    mutate(sumstat2 = "data/Ruzicka_sumstats/PASS_Unfolded_t_positive.sumstats", 
+           trait2 = "Unfolded_t_positive")
+)
+
+# Write the parameters file (run this separately in the command line, does not seem to work using system() from R)
+write.table(sapply(1:nrow(paras), get_gen_corr_ldsc, parameters = paras), 
+            file = "all_ldsc_commands", col.names = F, row.names = F, quote = F)
+
+```
+
+## Examine genetic correlation results produced by `ldsc`
+
+### Read in the `ldsc` results
+
+I also filter out any phenotypic traits where the genetic correlation with a Ruzicka et al. metric could not be accurately estimated, defined as having a genetic correlation SE greater than 0.2 (these typically arise when the phenotypic trait of interest has very low genetic variance).
+
+```{r}
+output_files <- list.files("ldsc_output", full.names = T)
+
+headers <- str_split(readLines(output_files[1])[61],  " ")[[1]]
+headers <- headers[nchar(headers)>0]
+results <- map(output_files, ~ {
+  lines <- readLines(.x)
+  lines[which(lines == "Summary of Genetic Correlation Results") + 2]
+  }) %>% 
+  map_df(~ {
+    xx <- str_split(.x,  " ")[[1]]
+    xx <- xx[nchar(xx)>0]
+    as.data.frame(t(xx))
+  })
+names(results) <- headers
+
+results <- results %>% 
+  left_join(focal_traits %>% select(description, unzipped_file), 
+            by = c("p1" = "unzipped_file")) %>% 
+  mutate(p1 = description) %>% select(-description) %>% 
+  mutate(p2 = str_remove_all(
+    str_remove_all(
+      str_remove_all(p2, "data/Ruzicka_sumstats/PASS_"), "sumstats"), "[.]")) %>% 
+  mutate(rg = as.numeric(rg), se = as.numeric(se), 
+         z = as.numeric(z), p = as.numeric(p),
+         h2_obs = as.numeric(h2_obs), h2_obs_se = as.numeric(h2_obs_se),
+         h2_int = as.numeric(h2_int), h2_int_se = as.numeric(h2_int_se),
+         gcov_int = as.numeric(gcov_int), gcov_int_se = as.numeric(gcov_int_se)) %>% 
+  rename(Trait = p1, `Test statistic` = p2) %>% 
+  as_tibble() %>% arrange(p) 
+
+dat <- results %>% 
+  split(.$Trait) %>% 
+  map_df(~ {
+    if(any(.x$se > 0.2) | any(is.na(.x$rg))) return(NULL)
+    return(.x)
+  })
+```
+
+### Inspect the `ldsc` results {.tabset}
+
+#### Figure
+
+```{r fig.width = 7, fig.height = 7}
+new_names_metrics <- tibble(
+  `Test statistic` = c("Adult_Fst", 
+                       "Reproductive_Fst", 
+                       "Gametic_Fst", "Lst", "t", 
+                       "Unfolded_Fst_negative", "Unfolded_Fst_positive",
+                       "Unfolded_t_negative", "Unfolded_t_positive"),
+  new_name = c("Adult~F[ST]", "Reproductive~F[ST]", 
+          "Gametic~F[ST]", "L[ST]", '"|"*t*"|"', 
+          "Unfolded~F[ST]~(Negative)", "Unfolded~F[ST]~(Positive)",
+          'Unfolded~"|"*t*"|"~(Negative)', 'Unfolded~"|"*t*"|"~(Positive)')) %>% 
+  mutate(new_name = factor(
+    new_name, levels = c("Adult~F[ST]", "L[ST]", # survival-related metrics
+                    "Reproductive~F[ST]", '"|"*t*"|"', # reproduction-related metrics
+                    "Gametic~F[ST]", # overall, then unfolded ones
+                    "Unfolded~F[ST]~(Negative)", "Unfolded~F[ST]~(Positive)",
+          'Unfolded~"|"*t*"|"~(Negative)', 'Unfolded~"|"*t*"|"~(Positive)'))) 
+
+x_labels <- levels(pull(new_names_metrics, 2))
+
+# # Get the row ordering (ranked by p-value of lowest-p metric)
+dat <- dat %>%
+  mutate( # trim the long phenotype names:
+    Trait = str_remove_all(Trait, "Mental health problems ever diagnosed by a professional[:] "),
+    Trait = factor(Trait, rev(unique(Trait)))) %>% 
+  left_join(new_names_metrics, by = "Test statistic")
+
+levs <- dat %>% group_by(Trait) %>% 
+  summarise(mean_log10_p = max(-log10(p)), .groups = "drop") %>% 
+  arrange(mean_log10_p) %>% pull(Trait) 
+
+correlation_figure <- dat %>%
+  split(.$`Test statistic`) %>% 
+  map_df(~ .x %>% mutate(p_adjust = p.adjust(p))) %>% 
+  mutate(Trait = factor(Trait, levs)) %>% 
+  mutate(Significance = ifelse(p < 0.05, "*", ""),
+         Significance = replace(Significance, p_adjust < 0.05, "**")) %>% 
+  ggplot(aes(new_name, Trait, fill = rg)) + 
+  geom_tile(colour = "grey20") +
+  geom_text(aes(label = Significance), colour = "grey20", vjust = 0.77) +
+  scale_fill_gradient2(
+    low = brewer.pal(9, "Blues")[7], 
+    high = brewer.pal(9, "Reds")[7], 
+    midpoint = 0, name = parse(text = "r[g]"),
+    guide = guide_colourbar(ticks.colour = "grey20", 
+                            frame.colour = "grey20")) +
+  scale_x_discrete(expand = c(0, 0), labels = parse(text = levels(dat$new_name))) +
+  scale_y_discrete(position = "right", expand = c(0, 0)) +
+  xlab(NULL) + ylab(NULL) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1.05, vjust = 1.04),
+        panel.border = element_rect(colour = "grey20", size = 0.6),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        legend.position = "left")
+
+
+correlation_figure %>% ggsave("Neale_corr_figure.pdf", plot = ., width = 7, height = 7)
+correlation_figure
+```
+
+#### Table
+
+```{r}
+DT::datatable(results)
+```
+
+
+## Make scripts to estimate the genetic correlation among all Ruzicka et al. metrics
+```{r}
+Ruz_sumstats <- c(
+  "data/Ruzicka_sumstats/PASS_Adult_Fst.sumstats",
+  "data/Ruzicka_sumstats/PASS_Reproductive_Fst.sumstats",
+  "data/Ruzicka_sumstats/PASS_Gametic_Fst.sumstats",
+  "data/Ruzicka_sumstats/PASS_Lst.sumstats",
+  "data/Ruzicka_sumstats/PASS_t.sumstats",
+  "data/Ruzicka_sumstats/PASS_Unfolded_Fst_negative.sumstats",
+  "data/Ruzicka_sumstats/PASS_Unfolded_Fst_positive.sumstats",
+  "data/Ruzicka_sumstats/PASS_Unfolded_t_negative.sumstats",
+  "data/Ruzicka_sumstats/PASS_Unfolded_t_positive.sumstats"
+)
+
+meanings <- tibble(sumstat = Ruz_sumstats) %>% 
+  mutate(trait = c("Adult_Fst", "Reproductive_Fst", "Gametic_Fst", "Lst", "t", 
+                   "Unfolded_Fst_negative", "Unfolded_Fst_positive", 
+                   "Unfolded_t_negative", "Unfolded_t_positive"))
+
+paras2 <- expand_grid(sumstat1 = Ruz_sumstats, sumstat2 = Ruz_sumstats) %>% 
+   left_join(meanings %>% rename(trait1=trait), by = c("sumstat1" = "sumstat")) %>% 
+   left_join(meanings %>% rename(trait2=trait), by = c("sumstat2" = "sumstat")) %>% 
+  filter(trait1 != trait2)
+
+get_gen_corr_ldsc <- function(row, parameters){
+  
+  sumstat1 <- parameters$sumstat1[row]  
+  sumstat2 <- parameters$sumstat2[row]
+  trait1 <- parameters$trait1[row]
+  trait2 <- parameters$trait2[row]
+  
+  outfile_name <-  file.path("ldsc_output2", paste(trait1, trait2, sep = "_x_"))
+  
+  glue("./ldsc.py --rg {sumstat1},{sumstat2} --ref-ld-chr eur_w_ld_chr/ --w-ld-chr eur_w_ld_chr/ --out {outfile_name}")
+}
+
+# Again, run the resulting file in the command line
+write.table(sapply(1:nrow(paras2), get_gen_corr_ldsc, parameters = paras2), 
+            file = "all_ldsc_commands2", col.names = F, row.names = F, quote = F)
+```
+
+### Inspect the `ldsc` results {.tabset}
+
+#### Figure
+
+```{r fig.width = 6, fig.height = 6.47}
+output_files2 <- list.files("ldsc_output2", full.names = T)
+
+headers <- str_split(readLines(output_files2[1])[61],  " ")[[1]]
+headers <- headers[nchar(headers) > 0]
+results_ruzicka <- map(output_files2, ~ {
+  lines <- readLines(.x)
+  lines[which(lines == "Summary of Genetic Correlation Results") + 2]
+  }) %>% 
+  map_df(~ {
+    xx <- str_split(.x,  " ")[[1]]
+    xx <- xx[nchar(xx)>0]
+    as.data.frame(t(xx))
+  })
+names(results_ruzicka) <- headers
+
+results_ruzicka <- results_ruzicka %>% 
+  left_join(meanings, by = c("p1" = "sumstat")) %>% 
+  mutate(p1 = trait) %>% select(-trait) %>% 
+  left_join(meanings, by = c("p2" = "sumstat")) %>%
+  mutate(p2 = trait) %>% select(-trait) %>% 
+  mutate(rg = as.numeric(rg), se = as.numeric(se), 
+         z = as.numeric(z), p = as.numeric(p),
+         h2_obs = as.numeric(h2_obs), h2_obs_se = as.numeric(h2_obs_se),
+         h2_int = as.numeric(h2_int), h2_int_se = as.numeric(h2_int_se),
+         gcov_int = as.numeric(gcov_int), gcov_int_se = as.numeric(gcov_int_se)) %>% 
+  rename(Trait1 = p1, Trait2 = p2) %>% 
+  as_tibble() %>% arrange(p) %>% 
+  mutate(rg = replace(rg, rg > 1, 1)) 
+
+ordering <- pull(arrange(new_names_metrics, new_name), `Test statistic`)
+new_labs <- pull(arrange(new_names_metrics, new_name), new_name) %>% as.character()
+ruz_figure <- results_ruzicka %>% 
+    select(Trait1, Trait2, rg, p) %>% 
+    bind_rows(tibble(Trait1 = meanings$trait, 
+                     Trait2 = meanings$trait, 
+                     rg = 1, p = 1)) %>% 
+    mutate(Trait1 = factor(Trait1, ordering),
+           Trait2 = factor(Trait2, rev(ordering))) %>% 
+    mutate(sig = ifelse(p < 0.05 & Trait1 != Trait2, "*", ""),
+           lab = paste(as.character(round(rg, 2)), sig, sep = ""),
+           lab = str_replace_all(lab, "NANA", ""),
+           lab = replace(lab, lab == "1", "")) %>% 
+    ggplot(aes(Trait1, Trait2, fill = rg)) + 
+    geom_tile(colour = "grey20") +
+    geom_text(aes(label = lab), size = 3) + 
+    scale_fill_gradient2(low = brewer.pal(7, "Purples")[6], 
+                         high = brewer.pal(7, "Oranges")[4], parse(text = "r[g]"),
+                         na.value = 'grey70',
+                         guide = guide_colourbar(ticks.colour = "grey20", 
+                                                 frame.colour = "grey20")) + 
+    scale_x_discrete(expand = c(0,0), labels = parse(text = new_labs)) + 
+    scale_y_discrete(expand = c(0,0), labels = parse(text = rev(new_labs))) +
+    xlab(NULL) + ylab(NULL) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1.05, vjust = 1.04),
+          panel.border = element_rect(colour = "grey20", size = 0.6, fill = NA),
+          legend.position = "top")
+
+ruz_figure %>% 
+    ggsave("Ruzicka_corr_figure.pdf", plot = ., width = 6, height = 6.47)
+ruz_figure
+```
+
+#### Table 
+
+```{r}
+DT::datatable(results_ruzicka)
+```
+
