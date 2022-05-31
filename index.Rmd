@@ -430,6 +430,7 @@ ruz_figure <- results_ruzicka %>%
     scale_fill_gradient2(low = brewer.pal(7, "Purples")[6], 
                          high = brewer.pal(7, "Oranges")[4], parse(text = "r[g]"),
                          na.value = 'grey70',
+                         breaks = c(0, 0.5, 1),
                          guide = guide_colourbar(ticks.colour = "grey20", 
                                                  frame.colour = "grey20")) + 
     scale_x_discrete(expand = c(0,0), labels = parse(text = new_labs)) + 
