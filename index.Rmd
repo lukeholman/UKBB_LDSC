@@ -405,10 +405,13 @@ results_ruzicka <- results_ruzicka %>%
          gcov_int = as.numeric(gcov_int), gcov_int_se = as.numeric(gcov_int_se)) %>% 
   rename(Trait1 = p1, Trait2 = p2) %>% 
   as_tibble() %>% arrange(p) %>% 
-  mutate(rg = replace(rg, rg > 1, 1)) 
+  mutate(rg = replace(rg, rg > 1, 1)) %>% 
+  filter(!str_detect(Trait1, "Unfolded") & !str_detect(Trait2, "Unfolded"))
 
 ordering <- pull(arrange(new_names_metrics, new_name), `Test statistic`)
 new_labs <- pull(arrange(new_names_metrics, new_name), new_name) %>% as.character()
+ordering <- ordering[!str_detect(ordering, "Unfolded")]
+new_labs <- new_labs[!str_detect(new_labs, "Unfolded")]
 ruz_figure <- results_ruzicka %>% 
     select(Trait1, Trait2, rg, p) %>% 
     bind_rows(tibble(Trait1 = meanings$trait, 
@@ -420,6 +423,7 @@ ruz_figure <- results_ruzicka %>%
            lab = paste(as.character(round(rg, 2)), sig, sep = ""),
            lab = str_replace_all(lab, "NANA", ""),
            lab = replace(lab, lab == "1", "")) %>% 
+    filter(!is.na(Trait1) & !is.na(Trait2)) %>% 
     ggplot(aes(Trait1, Trait2, fill = rg)) + 
     geom_tile(colour = "grey20") +
     geom_text(aes(label = lab), size = 3) + 
